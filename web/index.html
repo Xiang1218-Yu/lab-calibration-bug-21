@@ -1,0 +1,29 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>设备校准与异常追踪系统</title>
+  <link rel="stylesheet" href="/styles.css">
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🔬</text></svg>">
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand"><span class="logo">🔬</span> 校准与异常追踪</div>
+    <nav class="nav" id="nav">
+      <a href="#/dashboard" data-route="dashboard">总览</a>
+      <a href="#/devices" data-route="devices">设备</a>
+      <a href="#/calibrations" data-route="calibrations">校准记录</a>
+      <a href="#/events" data-route="events">运行事件</a>
+      <a href="#/issues" data-route="issues">待处理问题</a>
+      <a href="#/imports" data-route="imports">导入</a>
+      <a href="#/jobs" data-route="jobs">后台任务</a>
+    </nav>
+    <div class="spacer"></div>
+    <button class="theme-btn" id="themeBtn" title="切换主题">🌙</button>
+  </header>
+  <main id="app"></main>
+  <div class="toast" id="toast"></div>
+  <script src="/app.js"></script>
+</body>
+</html>

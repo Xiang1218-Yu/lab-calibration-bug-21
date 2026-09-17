@@ -1,0 +1,7 @@
+device_code,calibrated_at,result,technician,measured_value,nominal_value,tolerance,unit,notes
+BAL-001,2026-09-08 09:00,pass,张工,200.000,200.0,0.005,g,常规校准
+PH-014,2026-09-08 10:00,pass,王工,7.01,7.00,0.05,pH,更换电极后复测通过（将自动关闭问题）
+NEW-100,2026-09-08 11:00,pass,李工,10.0,10.0,0.1,mL,新设备（开启自动建档时）
+BAL-001,2026-09-08 09:00,pass,张工,200.000,200.0,0.005,g,与上一行重复，应判重
+OVN-007,not-a-date,pass,赵工,,,,,时间格式错误示例
+PH-014,2026-09-08 12:00,maybe,王工,7.0,7.0,0.05,pH,非法结果示例
