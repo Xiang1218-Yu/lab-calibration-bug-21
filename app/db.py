@@ -147,6 +147,94 @@ CREATE TABLE IF NOT EXISTS task_locks (
     acquired_at TEXT NOT NULL,
     expires_at  TEXT NOT NULL
 );
+
+-- Import lineage: every calibration row an import attempt wrote. Retries mark
+-- earlier attempts' rows 'cleared_by_retry' instead of losing the history;
+-- undo marks rows it deleted 'undone'. calibration_id has no FK on purpose:
+-- the calibration row may be deleted while the lineage must survive.
+CREATE TABLE IF NOT EXISTS import_items (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    import_job_id  INTEGER NOT NULL REFERENCES import_jobs(id) ON DELETE CASCADE,
+    attempt        INTEGER NOT NULL DEFAULT 1,
+    calibration_id INTEGER NOT NULL,
+    import_row     INTEGER,
+    content_hash   TEXT NOT NULL,
+    status         TEXT NOT NULL DEFAULT 'active', -- active|cleared_by_retry|undone
+    created_at     TEXT NOT NULL,
+    cleared_at     TEXT,
+    clear_reason   TEXT
+);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_import_items_cal ON import_items(calibration_id);
+CREATE INDEX IF NOT EXISTS idx_import_items_job ON import_items(import_job_id, status);
+
+-- Import side effects: issue transitions caused by imported calibrations.
+-- before/after snapshots let undo detect whether the issue was touched since.
+CREATE TABLE IF NOT EXISTS import_effects (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    import_job_id   INTEGER NOT NULL REFERENCES import_jobs(id) ON DELETE CASCADE,
+    calibration_id  INTEGER,
+    kind            TEXT NOT NULL DEFAULT 'issue_transition',
+    issue_id        INTEGER,
+    before_json     TEXT,
+    after_json      TEXT,
+    notification_id INTEGER,
+    status          TEXT NOT NULL DEFAULT 'active', -- active|reverted|compensated
+    created_at      TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_import_effects_job ON import_effects(import_job_id, status);
+
+-- Notification outbox: imports emit one per issue transition. Undo revokes
+-- 'pending' ones; 'sent' ones cannot be unsent -> compensation item.
+CREATE TABLE IF NOT EXISTS notifications (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    kind          TEXT NOT NULL,
+    import_job_id INTEGER,
+    issue_id      INTEGER,
+    message       TEXT NOT NULL,
+    status        TEXT NOT NULL DEFAULT 'pending', -- pending|sent|revoked
+    created_at    TEXT NOT NULL,
+    sent_at       TEXT,
+    revoked_at    TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_notifications_status ON notifications(status);
+
+-- Undo batches: the auditable two-phase undo operation itself.
+CREATE TABLE IF NOT EXISTS undo_batches (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    import_job_id INTEGER NOT NULL REFERENCES import_jobs(id) ON DELETE CASCADE,
+    status        TEXT NOT NULL DEFAULT 'preview', -- preview|confirmed|running|done|partial|failed|superseded
+    confirm_token TEXT NOT NULL,                   -- must be echoed from preview to confirm
+    operator      TEXT,                            -- who confirmed (permission/audit)
+    preview_json  TEXT,                            -- the diff shown at preview time
+    report_json   TEXT,                            -- execution report
+    last_error    TEXT,
+    created_at    TEXT NOT NULL,
+    confirmed_at  TEXT,
+    finished_at   TEXT
+);
+-- Only one live (non-terminal) undo per import batch.
+CREATE UNIQUE INDEX IF NOT EXISTS uq_undo_live
+    ON undo_batches(import_job_id)
+    WHERE status IN ('preview','confirmed','running');
+CREATE INDEX IF NOT EXISTS idx_undo_import ON undo_batches(import_job_id);
+
+-- Compensation items: everything an undo could not revert automatically.
+-- Never silent: a 'partial' undo always leaves pending rows here.
+CREATE TABLE IF NOT EXISTS compensations (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    undo_batch_id INTEGER NOT NULL REFERENCES undo_batches(id) ON DELETE CASCADE,
+    import_job_id INTEGER NOT NULL,
+    kind          TEXT NOT NULL, -- missing_row|source_conflict|depended|issue_state|notification_sent|artifact
+    ref_id        INTEGER,       -- calibration_id / issue_id / notification_id
+    detail        TEXT NOT NULL,
+    status        TEXT NOT NULL DEFAULT 'pending', -- pending|resolved
+    created_at    TEXT NOT NULL,
+    resolved_at   TEXT,
+    resolved_by   TEXT,
+    resolution    TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_comp_status ON compensations(status);
+CREATE INDEX IF NOT EXISTS idx_comp_import ON compensations(import_job_id);
 """
 
 _local = threading.local()

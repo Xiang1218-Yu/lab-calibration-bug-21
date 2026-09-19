@@ -24,7 +24,8 @@ class BaseCase(unittest.TestCase):
     def setUp(self):
         # Fresh schema for full isolation: rebuild in-memory-ish by clearing rows.
         db.init_db()
-        for t in ("issue_events", "issues", "calibrations", "events",
+        for t in ("compensations", "undo_batches", "import_items", "import_effects",
+                  "notifications", "issue_events", "issues", "calibrations", "events",
                   "import_jobs", "jobs", "task_locks", "devices"):
             db.execute(f"DELETE FROM {t}")
 

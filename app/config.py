@@ -21,6 +21,15 @@ TASK_MAX_RETRIES = int(os.environ.get("CALTRACK_TASK_MAX_RETRIES", "3"))
 TASK_TIMEOUT_SECONDS = float(os.environ.get("CALTRACK_TASK_TIMEOUT", "120"))
 TASK_POLL_INTERVAL = float(os.environ.get("CALTRACK_TASK_POLL_INTERVAL", "2"))
 
+# Single-flight advisory lock key shared by import execution and import undo,
+# so an undo never runs concurrently with an import (and vice versa).
+IMPORT_LOCK_KEY = "import:calibrations"
+
+# Import undo / compensation
+# A 'running' undo batch older than this is considered crashed and is failed
+# by the next preview (mirrors the jobs stale-recovery pattern).
+UNDO_STALE_SECONDS = int(os.environ.get("CALTRACK_UNDO_STALE_SECONDS", "600"))
+
 # Anomaly rules.
 # Consecutive abnormal (warning+ severity) events on one device within this
 # window raise an OPEN issue.

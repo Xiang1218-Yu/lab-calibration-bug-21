@@ -19,6 +19,8 @@ from ..services import (
     events as event_service,
     importer,
     issues as issue_service,
+    notifications as notify_service,
+    undo as undo_service,
 )
 from ..tasks import import_task  # noqa: F401  (registers the import task)
 from ..tasks import runner as task_runner
@@ -336,7 +338,73 @@ def get_import(c: Ctx):
     job = importer.get_import_job(c.int_param("id"))
     if not job:
         raise ApiError(404, "import job not found")
+    # Post-recovery view: latest undo state + open compensation items.
+    job["undo"] = undo_service.latest_undo_summary(job["id"])
+    job["pending_compensations"] = undo_service.count_compensations(
+        status="pending", import_job_id=job["id"])
     return job
+
+
+# import undo / compensation
+@route("POST", "/api/imports/{id}/undo/preview")
+def undo_preview(c: Ctx):
+    """Phase 1: compute the undo diff (changes nothing)."""
+    try:
+        return undo_service.preview_undo(c.int_param("id"))
+    except undo_service.UndoError as e:
+        raise ApiError(e.status, e.message)
+
+
+@route("POST", "/api/imports/{id}/undo/confirm")
+def undo_confirm(c: Ctx):
+    """Phase 2: execute a previewed undo. Body: {undo_id, confirm_token, operator}."""
+    body = c.json()
+    try:
+        return undo_service.confirm_undo(
+            c.int_param("id"), int(body.get("undo_id", 0)),
+            str(body.get("confirm_token", "")), body.get("operator"))
+    except undo_service.UndoError as e:
+        raise ApiError(e.status, e.message)
+
+
+@route("GET", "/api/imports/{id}/undo")
+def latest_undo(c: Ctx):
+    batch = undo_service.latest_undo_for_import(c.int_param("id"))
+    if batch is None:
+        raise ApiError(404, "no undo batch for this import")
+    return batch
+
+
+@route("GET", "/api/undo/{id}")
+def get_undo(c: Ctx):
+    try:
+        return undo_service.get_undo(c.int_param("id"))
+    except undo_service.UndoError as e:
+        raise ApiError(e.status, e.message)
+
+
+@route("GET", "/api/compensations")
+def list_compensations(c: Ctx):
+    return undo_service.list_compensations(
+        status=c.q("status"), import_job_id=c.qint("import_job_id"),
+        limit=c.qint("limit", 200))
+
+
+@route("POST", "/api/compensations/{id}/resolve")
+def resolve_compensation(c: Ctx):
+    body = c.json()
+    try:
+        return undo_service.resolve_compensation(
+            c.int_param("id"), body.get("operator"), body.get("resolution"))
+    except undo_service.UndoError as e:
+        raise ApiError(e.status, e.message)
+
+
+@route("GET", "/api/notifications")
+def list_notifications(c: Ctx):
+    return notify_service.list_notifications(
+        status=c.q("status"), import_job_id=c.qint("import_job_id"),
+        limit=c.qint("limit", 200))
 
 
 # background jobs

@@ -57,7 +57,8 @@ def cmd_once():
 def cmd_reseed():
     db.init_db()
     # Wipe domain data but keep jobs/locks.
-    for table in ("issue_events", "issues", "calibrations", "events",
+    for table in ("compensations", "undo_batches", "import_items", "import_effects",
+                  "notifications", "issue_events", "issues", "calibrations", "events",
                   "import_jobs", "devices"):
         db.execute(f"DELETE FROM {table}")
     seed.ensure_seed_data(force=True)

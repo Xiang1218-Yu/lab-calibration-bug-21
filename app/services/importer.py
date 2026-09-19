@@ -150,12 +150,19 @@ def finish_import_job(job_id: int, status: str, summary: dict, errors: list) -> 
 
 
 def process_rows(rows: list[dict], import_job_id: int,
-                 auto_create_devices: bool = False) -> dict:
+                 auto_create_devices: bool = False, attempt: int = 1) -> dict:
     """Validate + insert rows. Returns a summary dict and writes per-row errors.
 
     Each accepted calibration triggers issue state transitions via the shared
-    calibration service.
+    calibration service. Every inserted row and every issue transition is
+    recorded as undo lineage (``import_items`` / ``import_effects``) so the
+    batch can later be reverted auditably; transitions also emit a
+    notification into the outbox.
     """
+    from . import issues as issues_service
+    from . import notifications as notify
+    from . import undo as undo_service
+
     source = f"import:{import_job_id}"
     errors: list[dict] = []
     accepted = duplicate = error_count = 0
@@ -214,10 +221,24 @@ def process_rows(rows: list[dict], import_job_id: int,
             continue
 
         accepted += 1
-        # Record the issue transition this calibration caused.
-        from . import issues as issues_service
+        # Undo lineage: this row belongs to this batch/attempt.
+        undo_service.record_item(import_job_id, attempt, cal.id, idx, cal.content_hash)
+        # Record the issue transition this calibration caused, with before/after
+        # snapshots so undo can tell whether the issue was touched since.
+        issue_before = issues_service.open_issue_for_device(device.id)
         trans = issues_service.apply_calibration(cal)
         if trans.get("action") not in (None, "none", "noop"):
+            issue_after = issues_service.get(trans["issue_id"])
+            nid = notify.create(
+                kind="issue_transition",
+                message=(f"导入 #{import_job_id}：问题 #{trans['issue_id']} "
+                         f"{trans['from']} → {trans['to']}（校准结果 {cal.result}）"),
+                import_job_id=import_job_id, issue_id=trans["issue_id"])
+            undo_service.record_effect(
+                import_job_id, cal.id, trans["issue_id"],
+                undo_service.snapshot_issue(issue_before) if issue_before else None,
+                undo_service.snapshot_issue(issue_after) if issue_after else None,
+                nid)
             transitions.append({"row": idx, **trans})
 
     summary = {
