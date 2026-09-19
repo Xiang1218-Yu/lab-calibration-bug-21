@@ -44,7 +44,69 @@ python3 -m unittest discover -s tests   # 运行测试
 | 后台任务：失败重试 | 指数退避重试，超过 `max_attempts` 标记 `failed` |
 | 后台任务：超时恢复 | 心跳 + 陈旧 `running` 任务扫描，worker 崩溃后自动回收重试 |
 | 后台任务：重复执行保护 | 任务级幂等键（部分唯一索引）+ 全局咨询锁（单飞） |
+| 导入批次撤销 | 三类记录分类、两阶段预览/确认、事务+幂等+单飞锁、补偿工作清单 |
 | 前端 | 总览 KPI、设备详情、校准历史、异常时间线、待处理问题、导入、任务监控 |
+
+## 导入批次的可审计撤销与补偿
+
+撤销不能简单 `DELETE FROM calibrations WHERE source='import:<id>'`：那会误删同内容
+手工记录、无视已被后续状态依赖的记录、也无法恢复问题状态。系统把撤销做成一个
+**两阶段、可审计、带补偿** 的流程（`app/services/undo.py`）。
+
+### 三类记录分类（预览时判定，不触碰数据）
+
+* **可直接删除 `deletable`（A）**：记录没有引起任何问题状态变化，也没有后续依赖，
+  删除即可。
+* **已被后续状态依赖 `state_dependent`（B）**：该记录写入后，设备问题又发生了
+  *后续* 状态转换（人工处理/后续校准），盲目回滚会篡改历史。**记录保留**，生成
+  待处理补偿项（`dependent_record` / `manual_twin`），撤销结果为 `partial`。
+* **已影响问题状态 `state_driving`（C）**：该记录引起的转换仍是问题的**最新一次**
+  状态。删除记录并按 `issue_transitions` 中保存的快照把问题**逆向恢复**到此前状态，
+  同时写入一条 `action='restored'` 的补偿审计行。
+
+删除谓词带 `source!='manual'` 防护：同内容手工记录永不删除（
+`UNIQUE(device_id,content_hash)` 在写入侧兜底，分类器另有 `manual_twin` 防御分支）。
+
+### 一并处理的副作用
+
+* **导入重试历史**：每次尝试写入 `import_attempts`（含 running/succeeded/failed/
+  cleaned）。重试前用 `attempt_cleanup` 只清理**上次失败尝试**写入的行并逆向其状态；
+  已被后续依赖的转为 `retry_artifact` 补偿项，不再“清零重来”。
+* **附件**（`attachments`）：批次产生的附件标记 `revoked` 并把物理文件移入
+  `data/quarantine/`（可恢复），不硬删除；手工附件不处理。
+* **通知**（`notifications`）：批次发出的状态通知未读则 `retracted`；**已读/已确认**
+  的通知无法撤回，生成 `notification_read` 补偿项而不是假装成功。
+* **问题状态**：见上；恢复前用 `WHERE id=? AND status=?` 守卫，状态若已漂移则转为
+  `issue_state_moved` 补偿项。
+
+### 事务 / 幂等 / 并发锁 / 权限
+
+* **事务**：执行阶段整体包在一个 `BEGIN IMMEDIATE` 事务里（`db.transaction(immediate=True)`），
+  嵌套服务调用不会中途 commit；文件移入隔离区在提交后进行，失败会补一条补偿项。
+* **幂等**：提交支持 `X-Idempotency-Key`；重复提交返回同一撤销单（`replayed=true`）；
+  补偿项靠部分唯一索引 `uq_comp_active` 去重。
+* **并发锁**：每批次一把咨询锁 `undo:import:<job_id>`（跨线程/进程单飞），另加
+  IMMEDIATE 事务与问题状态条件更新双重防护；批次处于 processing 时拒绝撤销（409）。
+* **指纹防陈旧确认**：预览计算状态指纹 `fingerprint` 并返回 `confirm_token`；提交时
+  在锁内重算指纹，不一致即拒绝（可 `force=true` 强制作废旧预览）。
+* **权限确认**：身份/角色取自 `X-Actor` / `X-Role`（viewer/operator/admin），仅
+  `admin` 有 `import:undo`；提交必须显式 `{"confirm": true, "confirm_token": ...}`。
+
+### API
+
+```
+POST /api/imports/{id}/undo/preview     # 干跑：返回三类记录 diff、附件/通知、指纹、token
+POST /api/imports/{id}/undo/commit      # body: {confirm:true, confirm_token, fingerprint?}
+GET  /api/imports/{id}/undo             # 撤销结果与审计信息
+GET  /api/compensations[?status=&import_job_id=&kind=]
+POST /api/compensations/{id}/resolve    # 人工处理/忽略补偿项
+GET  /api/notifications | POST /api/notifications/{id}/read
+GET  /api/issues/{id}/transitions       # 问题状态机完整审计轨迹
+POST /api/imports/{id}/attachments | GET .../attachments
+```
+
+撤销单状态：`previewed → superseded/running → completed | partial | failed`。
+存在任何待处理补偿项时结果恒为 `partial`，**不会静默成功**；批次状态置为 `revoked`。
 
 ## 数据模型
 
@@ -53,7 +115,12 @@ devices 1───* calibrations        devices 1───* events
    │                                   │
    └────────* issues *─────────────────┘
                  │  issue_events (issues *─* events)
-jobs（后台任务）   import_jobs（导入批次 + 逐行错误）   task_locks（单飞锁）
+                 └─ issue_transitions（状态机审计/逆向日志）
+jobs（后台任务）   import_jobs（导入批次 + 逐行错误）
+   └─ import_attempts（每次重试的历史尝试）
+attachments（批次/校准附件）   notifications（状态通知/撤回）
+undo_batches（撤销单：预览/确认/结果）   compensation_items（待处理补偿）
+task_locks（单飞锁，含 undo:import:<id>）
 ```
 
 * **校准结果** `result`：`pass | fail | conditional`
@@ -111,6 +178,12 @@ GET   /api/issues/{id}                    POST /api/issues/{id}/resolve|reopen
 GET   /api/timeline/{device_id}
 POST  /api/imports?fmt=csv|tsv|json&auto_create=&sync=      (body 为文件内容)
 GET   /api/imports | /api/imports/{id}
+POST  /api/imports/{id}/undo/preview | /api/imports/{id}/undo/commit
+GET   /api/imports/{id}/undo
+GET   /api/compensations | POST /api/compensations/{id}/resolve
+GET   /api/notifications | POST /api/notifications/{id}/read
+GET   /api/issues/{id}/transitions
+POST  /api/imports/{id}/attachments | GET /api/imports/{id}/attachments
 GET   /api/jobs | /api/jobs/{id}
 ```
 
@@ -129,7 +202,10 @@ app/
   models.py            领域模型（Device/Calibration/Event/Issue）
   utils.py             时间戳、哈希、JSON
   services/
-    devices.py  calibrations.py  events.py  issues.py（规则+状态机）  importer.py
+    devices.py  calibrations.py  events.py  issues.py（规则+状态机+审计）
+    importer.py  attachments.py  notifications.py
+    undo.py（撤销/补偿引擎）  attempt_cleanup.py（重试安全清理）
+    compensation.py（补偿工作清单）  auth.py（角色/权限确认）
   tasks/
     locks.py           跨进程单飞咨询锁
     runner.py          队列、领取、重试、超时回收、worker

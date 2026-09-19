@@ -16,7 +16,7 @@ import io
 from typing import Any, Optional
 
 from .. import config, db
-from ..utils import iso, parse_ts, to_float, to_json
+from ..utils import from_json, iso, parse_ts, to_float, to_json
 from . import calibrations as cal_service
 from . import devices as device_service
 
@@ -137,8 +137,42 @@ def validate_row(row: dict) -> tuple[Optional[dict], list[str]]:
 def create_import_job(filename: Optional[str], total_rows: int) -> int:
     return db.execute(
         """INSERT INTO import_jobs (filename, status, total_rows, created_at)
-           VALUES (?, 'processing', ?, ?)""",
+           VALUES (?, 'pending', ?, ?)""",
         (filename, total_rows, iso()))
+
+
+def start_attempt(import_job_id: int, job_id: Optional[int] = None) -> int:
+    """Open the next attempt row for a batch (retry history)."""
+    row = db.query_one(
+        "SELECT COALESCE(MAX(attempt_no),0)+1 AS n FROM import_attempts "
+        "WHERE import_job_id=?", (import_job_id,))
+    attempt_no = row["n"] if row else 1
+    return db.execute(
+        """INSERT INTO import_attempts
+           (import_job_id, job_id, attempt_no, status, started_at)
+           VALUES (?,?,?, 'running', ?)""",
+        (import_job_id, job_id, attempt_no, iso()))
+
+
+def fail_attempt(attempt_id: int, error: str) -> None:
+    if not attempt_id:
+        return
+    db.execute(
+        "UPDATE import_attempts SET status='failed', finished_at=?, "
+        "summary_json=? WHERE id=?",
+        (iso(), to_json({"error": error}), attempt_id))
+
+
+def list_attempts(import_job_id: int) -> list[dict]:
+    rows = db.query(
+        "SELECT * FROM import_attempts WHERE import_job_id=? ORDER BY attempt_no",
+        (import_job_id,))
+    out = []
+    for r in rows:
+        d = dict(r)
+        d["summary"] = from_json(d.pop("summary_json", None), None)
+        out.append(d)
+    return out
 
 
 def finish_import_job(job_id: int, status: str, summary: dict, errors: list) -> None:
@@ -150,11 +184,15 @@ def finish_import_job(job_id: int, status: str, summary: dict, errors: list) -> 
 
 
 def process_rows(rows: list[dict], import_job_id: int,
-                 auto_create_devices: bool = False) -> dict:
+                 auto_create_devices: bool = False,
+                 import_attempt_id: Optional[int] = None,
+                 actor: Optional[str] = None,
+                 emit_notifications: bool = True) -> dict:
     """Validate + insert rows. Returns a summary dict and writes per-row errors.
 
     Each accepted calibration triggers issue state transitions via the shared
-    calibration service.
+    calibration service. Effective state changes produce a notification so the
+    undo flow later knows exactly what to retract.
     """
     source = f"import:{import_job_id}"
     errors: list[dict] = []
@@ -206,7 +244,9 @@ def process_rows(rows: list[dict], import_job_id: int,
                 nominal_value=clean["nominal_value"],
                 tolerance=clean["tolerance"],
                 unit=clean["unit"], notes=clean["notes"],
-                source=source, import_row=idx)
+                source=source, import_row=idx,
+                import_job_id=import_job_id,
+                import_attempt_id=import_attempt_id)
         except cal_service.CalibrationError as e:
             duplicate += 1
             errors.append({"row": idx, "duplicate": True,
@@ -216,9 +256,23 @@ def process_rows(rows: list[dict], import_job_id: int,
         accepted += 1
         # Record the issue transition this calibration caused.
         from . import issues as issues_service
-        trans = issues_service.apply_calibration(cal)
-        if trans.get("action") not in (None, "none", "noop"):
+        from . import notifications as notif_service
+        trans = issues_service.apply_calibration(
+            cal, import_job_id=import_job_id,
+            import_attempt_id=import_attempt_id, actor=actor)
+        if trans.get("action") not in (None, "none", "noop", "held_open"):
             transitions.append({"row": idx, **trans})
+            if emit_notifications:
+                notif_service.emit(
+                    type_="issue_state",
+                    title=f"问题 #{trans['issue_id']} 状态变更为 {trans.get('to')}",
+                    message=f"导入批次 {import_job_id} 第 {idx} 行校准结果 "
+                            f"{clean['result']} 驱动状态 {trans.get('from')} → "
+                            f"{trans.get('to')}",
+                    device_id=device.id, issue_id=trans["issue_id"],
+                    calibration_id=cal.id, import_job_id=import_job_id,
+                    import_attempt_id=import_attempt_id, created_by=actor,
+                    channels=["inapp"])
 
     summary = {
         "total": len(rows),
@@ -228,7 +282,15 @@ def process_rows(rows: list[dict], import_job_id: int,
         "transitions": transitions,
     }
     finish_import_job(import_job_id, "done", summary, errors)
-    return {"summary": summary, "errors": errors, "import_job_id": import_job_id}
+    if import_attempt_id is not None:
+        db.execute(
+            """UPDATE import_attempts SET status='succeeded', accepted_rows=?,
+               duplicate_rows=?, error_rows=?, summary_json=?, finished_at=?
+               WHERE id=?""",
+            (accepted, duplicate, error_count, to_json(summary), iso(),
+             import_attempt_id))
+    return {"summary": summary, "errors": errors, "import_job_id": import_job_id,
+            "import_attempt_id": import_attempt_id}
 
 
 def _safe_raw(raw: dict) -> dict:
@@ -243,6 +305,12 @@ def get_import_job(job_id: int) -> Optional[dict]:
     from ..utils import from_json
     d["summary"] = from_json(d.pop("summary_json", None), None)
     d["errors"] = from_json(d.pop("errors_json", None), [])
+    d["attempts"] = list_attempts(job_id)
+    d["attachment_count"] = db.query_one(
+        "SELECT COUNT(*) FROM attachments WHERE import_job_id=?", (job_id,))[0]
+    d["pending_compensation_count"] = db.query_one(
+        "SELECT COUNT(*) FROM compensation_items WHERE import_job_id=? AND status='pending'",
+        (job_id,))[0]
     return d
 
 

@@ -14,11 +14,16 @@ from typing import Any, Callable, Optional
 
 from .. import config, db
 from ..services import (
+    attachments as attachment_service,
+    auth,
     calibrations as cal_service,
+    compensation as comp_service,
     devices as device_service,
     events as event_service,
     importer,
     issues as issue_service,
+    notifications as notification_service,
+    undo as undo_service,
 )
 from ..tasks import import_task  # noqa: F401  (registers the import task)
 from ..tasks import runner as task_runner
@@ -64,6 +69,7 @@ class Ctx:
         self.params = match
         self.query = query
         self._body = body
+        self.headers = handler.headers
 
     def q(self, name: str, default: Optional[str] = None) -> Optional[str]:
         vals = self.query.get(name)
@@ -311,9 +317,10 @@ def create_import(c: Ctx):
     if c.qbool("sync"):
         # Process inline (handy for tests / no-worker setups).
         from ..tasks.import_task import run_import
+        princ = auth.principal(c.headers)
         summary = run_import(
             {"import_job_id": job_id, "path": str(path), "fmt": fmt,
-             "auto_create_devices": auto_create},
+             "auto_create_devices": auto_create, "actor": princ.actor},
             _InlineCtx())
         return importer.get_import_job(job_id) | {"sync": True, "summary": summary}
 
@@ -321,7 +328,8 @@ def create_import(c: Ctx):
     task_runner.enqueue(
         "import_calibrations",
         {"import_job_id": job_id, "path": str(path), "fmt": fmt,
-         "auto_create_devices": auto_create},
+         "auto_create_devices": auto_create,
+         "actor": (c.headers.get("X-Actor") or c.headers.get("x-actor"))},
         idempotency_key=idem)
     return importer.get_import_job(job_id)
 
@@ -337,6 +345,131 @@ def get_import(c: Ctx):
     if not job:
         raise ApiError(404, "import job not found")
     return job
+
+
+# -- import undo / compensation ---------------------------------------------
+
+@route("POST", "/api/imports/{id}/undo/preview")
+def undo_preview(c: Ctx):
+    princ = auth.principal(c.headers)
+    auth.require(princ, "import:undo")
+    job_id = c.int_param("id")
+    body = c.json()
+    try:
+        plan = undo_service.preview(
+            job_id, requested_by=princ.actor, reason=body.get("reason"),
+            force=c.qbool("force"))
+    except undo_service.UndoError as e:
+        raise ApiError(400, str(e))
+    except undo_service.UndoConflict as e:
+        raise ApiError(409, str(e))
+    return plan
+
+
+@route("POST", "/api/imports/{id}/undo/commit")
+def undo_commit(c: Ctx):
+    princ = auth.principal(c.headers)
+    auth.require(princ, "import:undo")
+    job_id = c.int_param("id")
+    body = c.json()
+    if body.get("confirm") is not True:
+        raise ApiError(400, 'must pass {"confirm": true} to execute an undo')
+    token = body.get("confirm_token")
+    if not token:
+        raise ApiError(400, "confirm_token from preview is required")
+    idem = c.headers.get("X-Idempotency-Key") or c.headers.get("x-idempotency-key")
+    try:
+        result = undo_service.commit(
+            job_id, token, requested_by=princ.actor,
+            expected_fingerprint=body.get("fingerprint"),
+            idem_key=idem, force=body.get("force") is True)
+    except undo_service.UndoError as e:
+        raise ApiError(400, str(e))
+    except undo_service.UndoConflict as e:
+        raise ApiError(409, str(e))
+    undo_service.set_confirmed_at(result["undo_batch_id"])
+    return result
+
+
+@route("GET", "/api/imports/{id}/undo")
+def undo_status(c: Ctx):
+    st = undo_service.status(c.int_param("id"))
+    if st is None:
+        raise ApiError(404, "no undo for this import batch")
+    return st
+
+
+@route("GET", "/api/compensations")
+def list_compensations(c: Ctx):
+    auth.require(auth.principal(c.headers), "read")
+    return comp_service.list_items(
+        status=c.q("status", "pending"),
+        import_job_id=c.qint("import_job_id"), kind=c.q("kind"))
+
+
+@route("POST", "/api/compensations/{id}/resolve")
+def resolve_compensation(c: Ctx):
+    princ = auth.principal(c.headers)
+    auth.require(princ, "compensation:resolve")
+    body = c.json()
+    try:
+        return comp_service.resolve(
+            c.int_param("id"),
+            resolution=body.get("resolution") or body.get("note") or "人工处理完成",
+            resolved_by=princ.actor,
+            new_status="ignored" if body.get("ignore") else "resolved")
+    except comp_service.CompensationError as e:
+        raise ApiError(404 if "not found" in str(e) else 400, str(e))
+
+
+@route("GET", "/api/notifications")
+def list_notifications(c: Ctx):
+    return notification_service.list_notifications(
+        status=c.q("status"), import_job_id=c.qint("import_job_id"),
+        limit=c.qint("limit", 200))
+
+
+@route("POST", "/api/notifications/{id}/read")
+def read_notification(c: Ctx):
+    n = notification_service.get(c.int_param("id"))
+    if not n:
+        raise ApiError(404, "notification not found")
+    return notification_service.mark_read(n["id"])
+
+
+@route("GET", "/api/issues/{id}/transitions")
+def issue_transitions(c: Ctx):
+    issue_id = c.int_param("id")
+    if not issue_service.get(issue_id):
+        raise ApiError(404, "issue not found")
+    rows = db.query(
+        "SELECT * FROM issue_transitions WHERE issue_id=? ORDER BY id", (issue_id,))
+    return [dict(r) for r in rows]
+
+
+@route("POST", "/api/imports/{id}/attachments")
+def add_import_attachment(c: Ctx):
+    princ = auth.principal(c.headers)
+    auth.require(princ, "import:create")
+    job_id = c.int_param("id")
+    if not importer.get_import_job(job_id):
+        raise ApiError(404, "import job not found")
+    filename = c.headers.get("X-Filename") or c.headers.get("x-filename") or "attachment.bin"
+    body = c._body
+    if not body:
+        raise ApiError(400, "empty attachment body")
+    a = attachment_service.register(
+        attachable_type="import_job", attachable_id=job_id, filename=filename,
+        content=body, source=f"import:{job_id}", import_job_id=job_id,
+        created_by=princ.actor)
+    return a
+
+
+@route("GET", "/api/imports/{id}/attachments")
+def list_import_attachments(c: Ctx):
+    if not importer.get_import_job(c.int_param("id")):
+        raise ApiError(404, "import job not found")
+    return attachment_service.list_for_batch(c.int_param("id"))
 
 
 # background jobs
@@ -365,6 +498,8 @@ def get_job(c: Ctx):
 
 class _InlineCtx:
     """Minimal stand-in for JobContext for synchronous (sync=true) imports."""
+    job_id = None
+
     def heartbeat(self):
         return True
 
@@ -433,6 +568,8 @@ class Handler(BaseHTTPRequestHandler):
                 try:
                     result = fn(ctx)
                 except ApiError as e:
+                    return self._send_json(e.status, {"error": e.message})
+                except auth.AuthorizationError as e:
                     return self._send_json(e.status, {"error": e.message})
                 except Exception as e:  # noqa: BLE001
                     import traceback

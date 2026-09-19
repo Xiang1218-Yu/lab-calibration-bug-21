@@ -160,10 +160,29 @@ def _shift(ts_iso: str, minutes: int) -> "datetime":
 
 # -- calibration-driven transitions ----------------------------------------
 
-def apply_calibration(calibration) -> dict:
+def _log_transition(issue, from_status, to_status, action, *,
+                    cause_type, cause_id=None, import_job_id=None,
+                    import_attempt_id=None, actor=None,
+                    reversal_of_id=None, snapshot=None) -> int:
+    snap = snapshot if snapshot is not None else {}
+    return db.execute(
+        """INSERT INTO issue_transitions
+           (issue_id, device_id, from_status, to_status, action, cause_type,
+            cause_id, import_job_id, import_attempt_id, actor,
+            from_resolved_at, from_resolution, reversal_of_id, created_at)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+        (issue.id, issue.device_id, from_status, to_status, action, cause_type,
+         cause_id, import_job_id, import_attempt_id, actor,
+         snap.get("resolved_at"), snap.get("resolution"), reversal_of_id, iso()))
+
+
+def apply_calibration(calibration, *, import_job_id=None,
+                      import_attempt_id=None, actor=None) -> dict:
     """Update issue state based on a calibration result.
 
     Returns a dict describing the transition taken (for import summaries/logs).
+    Every effective change is appended to ``issue_transitions`` so it can later
+    be inverted by an import undo.
     """
     issue = open_issue_for_device(calibration.device_id)
     if issue is None:
@@ -171,6 +190,12 @@ def apply_calibration(calibration) -> dict:
 
     result = calibration.result
     transition = {"issue_id": issue.id, "from": issue.status, "result": result}
+    cause_type = "calibration"
+    job_id = import_job_id if import_job_id is not None else getattr(
+        calibration, "import_job_id", None)
+    attempt_id = import_attempt_id if import_attempt_id is not None else getattr(
+        calibration, "import_attempt_id", None)
+    snapshot = {"resolved_at": issue.resolved_at, "resolution": issue.resolution}
 
     if result == config.RESULT_PASS:
         db.execute(
@@ -191,26 +216,42 @@ def apply_calibration(calibration) -> dict:
         transition.update(to="open", action="reopened" if issue.status == "monitoring" else "held_open")
     else:
         transition.update(to=issue.status, action="noop")
+        return transition
+
+    tid = _log_transition(
+        issue, issue.status, transition["to"], transition["action"],
+        cause_type=cause_type, cause_id=calibration.id,
+        import_job_id=job_id, import_attempt_id=attempt_id, actor=actor,
+        snapshot=snapshot)
+    transition["transition_id"] = tid
     return transition
 
 
-def resolve(issue_id: int, resolution: Optional[str] = None) -> Issue:
+def resolve(issue_id: int, resolution: Optional[str] = None,
+            actor: Optional[str] = None) -> Issue:
     issue = get(issue_id)
     if issue is None:
         raise IssueError(f"issue {issue_id} not found")
+    snapshot = {"resolved_at": issue.resolved_at, "resolution": issue.resolution}
     db.execute(
         "UPDATE issues SET status='resolved', resolved_at=?, resolution=?, updated_at=? WHERE id=?",
         (iso(), resolution or "人工标记为已处理", iso(), issue_id))
+    _log_transition(issue, issue.status, "resolved", "manual",
+                    cause_type="manual", actor=actor, snapshot=snapshot)
     return get(issue_id)
 
 
-def reopen(issue_id: int, reason: Optional[str] = None) -> Issue:
+def reopen(issue_id: int, reason: Optional[str] = None,
+           actor: Optional[str] = None) -> Issue:
     issue = get(issue_id)
     if issue is None:
         raise IssueError(f"issue {issue_id} not found")
+    snapshot = {"resolved_at": issue.resolved_at, "resolution": issue.resolution}
     db.execute(
         "UPDATE issues SET status='open', resolved_at=NULL, updated_at=? WHERE id=?",
         (iso(), issue_id))
+    _log_transition(issue, issue.status, "open", "manual",
+                    cause_type="manual", actor=actor, snapshot=snapshot)
     return get(issue_id)
 
 

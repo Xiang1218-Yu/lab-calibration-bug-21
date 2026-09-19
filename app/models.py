@@ -66,6 +66,8 @@ class Calibration:
     notes: Optional[str] = None
     source: str = "manual"
     import_row: Optional[int] = None
+    import_job_id: Optional[int] = None
+    import_attempt_id: Optional[int] = None
     content_hash: str = ""
     id: Optional[int] = None
     created_at: Optional[str] = None
@@ -81,6 +83,9 @@ class Calibration:
             measured_value=r["measured_value"], nominal_value=r["nominal_value"],
             tolerance=r["tolerance"], unit=r["unit"], notes=r["notes"],
             source=r["source"], import_row=r["import_row"],
+            import_job_id=r["import_job_id"] if "import_job_id" in r.keys() else None,
+            import_attempt_id=(r["import_attempt_id"]
+                               if "import_attempt_id" in r.keys() else None),
             content_hash=r["content_hash"], created_at=r["created_at"],
         )
 

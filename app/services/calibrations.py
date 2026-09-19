@@ -31,7 +31,9 @@ def insert_calibration(device_id: int, calibrated_at: str, result: str,
                        tolerance: Optional[float] = None,
                        unit: Optional[str] = None, notes: Optional[str] = None,
                        source: str = "manual",
-                       import_row: Optional[int] = None) -> Calibration:
+                       import_row: Optional[int] = None,
+                       import_job_id: Optional[int] = None,
+                       import_attempt_id: Optional[int] = None) -> Calibration:
     """Insert one calibration. Caller has validated the device exists.
 
     Raises :class:`CalibrationError` on a duplicate. Returns the stored record.
@@ -47,10 +49,11 @@ def insert_calibration(device_id: int, calibrated_at: str, result: str,
         """INSERT INTO calibrations
            (device_id, calibrated_at, result, technician, measured_value,
             nominal_value, tolerance, unit, notes, source, import_row,
-            content_hash, created_at)
-           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            import_job_id, import_attempt_id, content_hash, created_at)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
         (device_id, calibrated_at, result, technician, measured_value,
-         nominal_value, tolerance, unit, notes, source, import_row, chash, iso()),
+         nominal_value, tolerance, unit, notes, source, import_row,
+         import_job_id, import_attempt_id, chash, iso()),
     )
     return get(new_id)
 

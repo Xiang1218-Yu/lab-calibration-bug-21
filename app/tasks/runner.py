@@ -60,7 +60,7 @@ class JobContext:
         cur = db.get_conn().execute(
             "UPDATE jobs SET heartbeat_at=?, updated_at=? WHERE id=? AND run_lock=?",
             (iso(), iso(), self.job_id, self.token))
-        db.get_conn().commit()
+        db.commit()
         return cur.rowcount == 1
 
     @property
@@ -151,7 +151,7 @@ def _recover_stale() -> int:
                last_error=?, updated_at=?
                WHERE id=? AND status='running' AND run_lock=?""",
             (new_status, next_run, last_error, iso(now), job["id"], job["run_lock"]))
-        db.get_conn().commit()
+        db.commit()
         if cur.rowcount == 1:
             recovered += 1
     return recovered
@@ -172,7 +172,7 @@ def _claim_next() -> Optional[dict]:
                heartbeat_at=?, attempts=attempts+1, updated_at=?
                WHERE id=? AND status IN ('pending','retrying') AND next_run_at<=?""",
             (token, now_iso, now_iso, now_iso, cand["id"], now_iso))
-        db.get_conn().commit()
+        db.commit()
         if cur.rowcount == 1:
             return dict(db.query_one("SELECT * FROM jobs WHERE id=?", (cand["id"],)))
     return None
@@ -191,14 +191,14 @@ def _schedule_retry(job: dict, error: str) -> None:
         db.get_conn().execute(
             "UPDATE jobs SET status='retrying', run_lock=NULL, last_error=?, next_run_at=?, updated_at=? WHERE id=?",
             (error, iso(nxt), iso(now), job["id"]))
-    db.get_conn().commit()
+    db.commit()
 
 
 def _mark_success(job: dict, result: Any) -> None:
     db.get_conn().execute(
         "UPDATE jobs SET status='success', run_lock=NULL, result_json=?, last_error=NULL, updated_at=? WHERE id=?",
         (to_json({"result": result}), iso(), job["id"]))
-    db.get_conn().commit()
+    db.commit()
 
 
 # -- execution --------------------------------------------------------------

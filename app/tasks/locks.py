@@ -55,7 +55,7 @@ def refresh(lock_key: str, token: str, ttl_seconds: float = 300.0) -> bool:
     cur = db.get_conn().execute(
         "UPDATE task_locks SET expires_at=? WHERE lock_key=? AND lock_token=?",
         (iso(expires), lock_key, token))
-    db.get_conn().commit()
+    db.commit()
     return cur.rowcount == 1
 
 
@@ -63,7 +63,7 @@ def release(lock_key: str, token: str) -> None:
     db.get_conn().execute(
         "DELETE FROM task_locks WHERE lock_key=? AND lock_token=?",
         (lock_key, token))
-    db.get_conn().commit()
+    db.commit()
 
 
 def is_held(lock_key: str) -> bool:

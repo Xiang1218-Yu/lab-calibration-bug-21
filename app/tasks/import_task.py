@@ -5,19 +5,21 @@ enqueues this task. The task:
 
 * takes a single-flight advisory lock so two imports never run concurrently
   (duplicate-execution protection),
-* makes the run idempotent by clearing any rows from a previous attempt
-  (retries then reproduce a correct result rather than double-counting),
+* opens an ``import_attempts`` row so every retry leaves durable history,
+* makes a retry safe by cleaning *only* the previous attempt's writes through
+  :mod:`attempt_cleanup` (state that has since moved on becomes a compensation
+  item instead of being force-deleted),
 * heartbeats while processing so a wedged import is detected as timed out,
 * records the full report (accepted / duplicate / errors) on ``import_jobs``.
 """
 from __future__ import annotations
 
 import os
-from pathlib import Path
 
 from .. import config, db
 from ..services import importer
-from ..utils import iso, to_json
+from ..services import attempt_cleanup
+from ..utils import iso
 from . import locks
 from .runner import task
 
@@ -31,18 +33,26 @@ def run_import(payload: dict, ctx) -> dict:
     path = payload["path"]
     fmt = payload.get("fmt", "csv")
     auto_create = bool(payload.get("auto_create_devices", False))
+    actor = payload.get("actor")
 
     # Single-flight: only one import at a time across workers/processes.
     token = locks.acquire(IMPORT_LOCK_KEY, ttl_seconds=IMPORT_LOCK_TTL)
     if token is None:
         # Another import is running; raise so this job retries shortly.
         raise RuntimeError("another import is already running; will retry")
+    attempt_id = None
     try:
-        # Idempotency: wipe rows from any earlier attempt so a retry rebuilds
-        # the exact result instead of counting them as duplicates.
-        db.execute(
-            "DELETE FROM calibrations WHERE source=?",
-            (f"import:{import_job_id}",))
+        attempt_id = importer.start_attempt(import_job_id, job_id=ctx.job_id)
+        db.execute("UPDATE import_jobs SET status='processing' WHERE id=?",
+                   (import_job_id,))
+
+        # Safe retry: remove rows/notifications of earlier *failed* attempts,
+        # generating compensation items where state can't be auto-rewound.
+        prior = db.query(
+            "SELECT id FROM import_attempts WHERE import_job_id=? AND id!=? "
+            "AND status='failed'", (import_job_id, attempt_id))
+        for p in prior:
+            attempt_cleanup.cleanup_attempt(import_job_id, p["id"])
 
         with open(path, "r", encoding="utf-8-sig", newline="") as fh:
             content = fh.read()
@@ -50,14 +60,18 @@ def run_import(payload: dict, ctx) -> dict:
             raise RuntimeError("lost job lock during import")
 
         rows = importer.parse_content(content, fmt=fmt)
-        db.execute("UPDATE import_jobs SET status='processing', total_rows=? WHERE id=?",
+        db.execute("UPDATE import_jobs SET total_rows=? WHERE id=?",
                    (len(rows), import_job_id))
 
-        result = importer.process_rows(rows, import_job_id,
-                                       auto_create_devices=auto_create)
+        result = importer.process_rows(
+            rows, import_job_id, auto_create_devices=auto_create,
+            import_attempt_id=attempt_id, actor=actor)
         if not ctx.heartbeat():
             raise RuntimeError("lost job lock during import")
         return result["summary"]
+    except Exception as exc:
+        importer.fail_attempt(attempt_id, f"{type(exc).__name__}: {exc}")
+        raise
     finally:
         locks.release(IMPORT_LOCK_KEY, token)
         # Best-effort cleanup of the uploaded scratch file.
